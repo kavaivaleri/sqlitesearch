@@ -7,7 +7,7 @@ coverage:
 	uv run pytest --cov=sqlitesearch --cov-report=term-missing --cov-report=html
 
 setup:
-	uv sync --extra dev
+	uv sync --dev
 
 shell:
 	uv shell
