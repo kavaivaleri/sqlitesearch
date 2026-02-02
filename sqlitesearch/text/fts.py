@@ -42,6 +42,7 @@ class TextSearchIndex:
         keyword_fields: Optional[list[str]] = None,
         id_field: Optional[str] = None,
         db_path: str = "sqlitesearch.db",
+        stemming: bool = False,
     ):
         """
         Initialize the TextSearchIndex.
@@ -51,11 +52,13 @@ class TextSearchIndex:
             keyword_fields: List of field names for exact filtering (not full-text searched).
             id_field: Field name to use as document ID. If None, auto-generates IDs.
             db_path: Path to the SQLite database file.
+            stemming: If True, use Porter stemmer for better matching (e.g., "running" matches "run").
         """
         self.text_fields = text_fields
         self.keyword_fields = list(keyword_fields) if keyword_fields is not None else []
         self.id_field = id_field
         self.db_path = db_path
+        self.stemming = stemming
         self._local = threading.local()
 
         # Add id_field to keyword_fields if provided and not already there
@@ -90,12 +93,20 @@ class TextSearchIndex:
             )
         """)
 
-        # Create FTS5 virtual table WITHOUT content table - simpler structure
+        # Create FTS5 virtual table
+        # Note: tokenizer applies to both indexing AND querying
         fts_columns = ["docid"] + [f'"{col}"' for col in self.text_fields]
         fts_col_list = ", ".join(fts_columns)
+
+        if self.stemming:
+            tokenizer = "tokenize='porter unicode61'"
+        else:
+            tokenizer = "tokenize='unicode61'"
+
         cursor.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
-                {fts_col_list}
+                {fts_col_list},
+                {tokenizer}
             )
         """)
 
@@ -223,6 +234,10 @@ class TextSearchIndex:
         if boost_dict is None:
             boost_dict = {}
 
+        # Handle empty query - return empty results
+        if not query or not query.strip():
+            return []
+
         conn = self._get_conn()
         cursor = conn.cursor()
 
@@ -287,11 +302,14 @@ class TextSearchIndex:
         Returns:
             An FTS5 query string.
         """
+        query_terms = self._extract_query_terms(query)
+
+        # Note: empty queries are handled in search() method
         if not boost_dict:
-            return self._escape_fts_query(query)
+            # OR query - any term matches (better recall)
+            return " OR ".join(query_terms)
 
         # Build boosted query for each field
-        query_terms = self._extract_query_terms(query)
         parts = []
 
         for field in self.text_fields:
@@ -299,10 +317,11 @@ class TextSearchIndex:
             if boost == 0:
                 continue
 
-            field_query = " ".join(query_terms)
+            # Use OR within field for better recall
+            field_query = " OR ".join(query_terms)
             parts.append(f'"{field}":({field_query})')
 
-        return " OR ".join(parts) if parts else self._escape_fts_query(query)
+        return " OR ".join(parts) if parts else " OR ".join(query_terms)
 
     def _extract_query_terms(self, query: str) -> list[str]:
         """

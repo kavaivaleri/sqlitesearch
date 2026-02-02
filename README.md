@@ -74,6 +74,21 @@ results = index.search(
 )
 ```
 
+### Stemming
+
+Enable Porter stemming for better matching of word variants:
+
+```python
+# With stemming, "running" matches "run", "courses" matches "course", etc.
+index = TextSearchIndex(
+    text_fields=["title", "description"],
+    stemming=True,
+    db_path="search.db"
+)
+```
+
+By default, stemming is disabled to match minsearch behavior.
+
 ### Adding documents
 
 ```python
