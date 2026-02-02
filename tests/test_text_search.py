@@ -4,8 +4,8 @@ Comprehensive tests for TextSearchIndex based on minsearch patterns.
 
 import os
 import tempfile
+
 import pytest
-import numpy as np
 
 from sqlitesearch import TextSearchIndex
 

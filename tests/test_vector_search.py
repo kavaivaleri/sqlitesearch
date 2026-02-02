@@ -4,8 +4,9 @@ Comprehensive tests for VectorSearchIndex based on minsearch patterns.
 
 import os
 import tempfile
-import pytest
+
 import numpy as np
+import pytest
 
 from sqlitesearch import VectorSearchIndex
 

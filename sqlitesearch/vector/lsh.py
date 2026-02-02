@@ -5,10 +5,10 @@ This module provides approximate nearest neighbor search using Locality-Sensitiv
 Hashing (LSH) with random projections, followed by exact cosine similarity reranking.
 """
 
-import sqlite3
 import json
-import threading
 import pickle
+import sqlite3
+import threading
 from typing import Any, Optional
 
 import numpy as np

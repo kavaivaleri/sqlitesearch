@@ -5,9 +5,9 @@ This module provides a text search index backed by SQLite's FTS5 (Full-Text Sear
 extension, enabling efficient BM25 ranking and boolean queries.
 """
 
+import json
 import re
 import sqlite3
-import json
 import threading
 from typing import Any, Optional
 
