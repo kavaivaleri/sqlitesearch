@@ -345,8 +345,8 @@ class TestVectorSearchIndexSortingCorrectness:
             {"id": 4, "title": "Least Similar"}
         ]
 
-        # Use more hash tables for better recall on small datasets
-        index = VectorSearchIndex(n_tables=16, hash_size=10, db_path=temp_db)
+        # Use aggressive LSH parameters to ensure high recall for this test
+        index = VectorSearchIndex(n_tables=50, hash_size=10, db_path=temp_db)
         index.fit(vectors, payload)
 
         # Query vector identical to vector 0
