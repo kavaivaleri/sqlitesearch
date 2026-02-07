@@ -9,7 +9,10 @@ import json
 import re
 import sqlite3
 import threading
+from datetime import date, datetime
 from typing import Any, Optional
+
+from sqlitesearch.operators import OPERATORS, is_range_filter
 
 
 class TextSearchIndex:
@@ -20,7 +23,7 @@ class TextSearchIndex:
     full-text search with BM25 ranking.
 
     API matches minsearch.Index for easy migration:
-    - __init__(text_fields, keyword_fields=None, id_field=None)
+    - __init__(text_fields, keyword_fields=None, numeric_fields=None, date_fields=None, id_field=None)
     - fit(docs) - Index documents (only if index is empty)
     - add(doc) - Add a single document to existing index
     - search(query, filter_dict=None, boost_dict=None, num_results=10, output_ids=False)
@@ -29,17 +32,21 @@ class TextSearchIndex:
         >>> index = TextSearchIndex(
         ...     text_fields=["title", "description"],
         ...     keyword_fields=["category"],
+        ...     numeric_fields=["price", "rating"],
+        ...     date_fields=["created_at"],
         ...     id_field="id",
         ...     db_path="search.db"
         ... )
-        >>> index.fit([{"id": 1, "title": "Hello", "description": "World"}])
-        >>> results = index.search("hello world")
+        >>> index.fit([{"id": 1, "title": "Hello", "description": "World", "price": 100}])
+        >>> results = index.search("hello", filter_dict={"price": [('>=', 50), ('<', 200)]})
     """
 
     def __init__(
         self,
         text_fields: list[str],
         keyword_fields: Optional[list[str]] = None,
+        numeric_fields: Optional[list[str]] = None,
+        date_fields: Optional[list[str]] = None,
         id_field: Optional[str] = None,
         db_path: str = "sqlitesearch.db",
         stemming: bool = False,
@@ -50,12 +57,16 @@ class TextSearchIndex:
         Args:
             text_fields: List of field names to index with FTS5.
             keyword_fields: List of field names for exact filtering (not full-text searched).
+            numeric_fields: List of field names for numeric range filtering.
+            date_fields: List of field names for date range filtering.
             id_field: Field name to use as document ID. If None, auto-generates IDs.
             db_path: Path to the SQLite database file.
             stemming: If True, use Porter stemmer for better matching (e.g., "running" matches "run").
         """
         self.text_fields = text_fields
         self.keyword_fields = list(keyword_fields) if keyword_fields is not None else []
+        self.numeric_fields = list(numeric_fields) if numeric_fields is not None else []
+        self.date_fields = list(date_fields) if date_fields is not None else []
         self.id_field = id_field
         self.db_path = db_path
         self.stemming = stemming
@@ -85,11 +96,23 @@ class TextSearchIndex:
             keyword_cols.append(f', "{field}" TEXT')
         keyword_sql = "\n".join(keyword_cols)
 
+        # Build numeric column definitions
+        numeric_cols = []
+        for field in self.numeric_fields:
+            numeric_cols.append(f', "{field}" REAL')
+        numeric_sql = "\n".join(numeric_cols)
+
+        # Build date column definitions (store as ISO 8601 strings for comparison)
+        date_cols = []
+        for field in self.date_fields:
+            date_cols.append(f', "{field}" TEXT')
+        date_sql = "\n".join(date_cols)
+
         # Create main documents table
         cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS docs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doc_json TEXT NOT NULL{keyword_sql}
+                doc_json TEXT NOT NULL{keyword_sql}{numeric_sql}{date_sql}
             )
         """)
 
@@ -113,6 +136,14 @@ class TextSearchIndex:
         # Create indexes on keyword fields for faster filtering
         for field in self.keyword_fields:
             cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_{field} ON docs ("{field}")')
+
+        # Create indexes on numeric fields for faster filtering
+        for field in self.numeric_fields:
+            cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_num_{field} ON docs ("{field}")')
+
+        # Create indexes on date fields for faster filtering
+        for field in self.date_fields:
+            cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_date_{field} ON docs ("{field}")')
 
         conn.commit()
 
@@ -164,19 +195,44 @@ class TextSearchIndex:
         conn = self._get_conn()
         cursor = conn.cursor()
 
-        # Build column lists
-        all_cols = ["doc_json"] + [f'"{field}"' for field in self.keyword_fields]
+        # Build column lists including keyword, numeric, and date fields
+        filter_cols = (
+            [f'"{field}"' for field in self.keyword_fields] +
+            [f'"{field}"' for field in self.numeric_fields] +
+            [f'"{field}"' for field in self.date_fields]
+        )
+        all_cols = ["doc_json"] + filter_cols
         col_names = ", ".join(all_cols)
         placeholders = ", ".join(["?"] * len(all_cols))
 
         for doc in docs:
-            doc_json = json.dumps(doc)
+            # Convert date/datetime objects to ISO format for JSON serialization
+            doc_for_json = {}
+            for key, value in doc.items():
+                if isinstance(value, (date, datetime)):
+                    doc_for_json[key] = value.isoformat()
+                else:
+                    doc_for_json[key] = value
+            doc_json = json.dumps(doc_for_json)
+
             keyword_vals = [doc.get(field) for field in self.keyword_fields]
+
+            # Extract numeric values
+            numeric_vals = [doc.get(field) for field in self.numeric_fields]
+
+            # Extract date values and convert to ISO format
+            date_vals = []
+            for field in self.date_fields:
+                value = doc.get(field)
+                if isinstance(value, (date, datetime)):
+                    date_vals.append(value.isoformat())
+                else:
+                    date_vals.append(value)
 
             # Insert into main table
             cursor.execute(
                 f"INSERT INTO docs ({col_names}) VALUES ({placeholders})",
-                [doc_json] + keyword_vals
+                [doc_json] + keyword_vals + numeric_vals + date_vals
             )
             doc_id = cursor.lastrowid
 
@@ -221,7 +277,12 @@ class TextSearchIndex:
 
         Args:
             query: The search query string. Supports FTS5 query syntax.
-            filter_dict: Dictionary of keyword fields to filter by.
+            filter_dict: Dictionary of filters. Can include:
+                - Keyword fields: {"field": "value"} for exact match
+                - Numeric fields: {"field": [('>=', 100), ('<', 200)]} for range filters
+                - Numeric fields: {"field": 100} for exact match
+                - Date fields: {"field": [('>=', date(...)), ('<', date(...))]} for range filters
+                - Any field: {"field": None} for null/missing values
             boost_dict: Dictionary of boost scores for text fields.
             num_results: Maximum number of results to return.
             output_ids: If True, adds an 'id' field with the document ID.
@@ -244,17 +305,30 @@ class TextSearchIndex:
         # Build FTS5 query with boosts
         fts_query = self._build_fts_query(query, boost_dict)
 
-        # Build WHERE clause for keyword filters
+        # Build WHERE clause for filters (keyword, numeric, date)
         where_clauses = []
         where_params = []
 
         for field, value in filter_dict.items():
             if field in self.keyword_fields:
+                # Keyword field filters (exact match)
                 if value is None:
                     where_clauses.append(f'd."{field}" IS NULL')
                 else:
                     where_clauses.append(f'd."{field}" = ?')
                     where_params.append(value)
+
+            elif field in self.numeric_fields:
+                # Numeric field filters (exact match or range)
+                where_clauses, where_params = self._add_numeric_filter(
+                    where_clauses, where_params, field, value
+                )
+
+            elif field in self.date_fields:
+                # Date field filters (exact match or range)
+                where_clauses, where_params = self._add_date_filter(
+                    where_clauses, where_params, field, value
+                )
 
         where_sql = " AND " + " AND ".join(where_clauses) if where_clauses else ""
 
@@ -277,6 +351,8 @@ class TextSearchIndex:
         results = []
         for row in rows:
             doc = json.loads(row["doc_json"])
+            # Convert ISO date strings back to date/datetime objects
+            doc = self._convert_dates(doc)
             if output_ids:
                 # Use id_field value if available, otherwise use database id
                 if self.id_field:
@@ -290,6 +366,111 @@ class TextSearchIndex:
             results.append(doc)
 
         return results
+
+    def _convert_dates(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """
+        Convert ISO date strings back to date/datetime objects for date_fields.
+
+        Args:
+            doc: Document with potentially ISO formatted date strings.
+
+        Returns:
+            Document with date fields converted back to date/datetime objects.
+        """
+        if not self.date_fields:
+            return doc
+
+        for field in self.date_fields:
+            if field in doc and doc[field] is not None:
+                value = doc[field]
+                if isinstance(value, str):
+                    # Check if string contains time component (has 'T' or ' ')
+                    has_time = 'T' in value or ' ' in value
+
+                    if has_time:
+                        # Parse as datetime
+                        try:
+                            doc[field] = datetime.fromisoformat(value)
+                        except ValueError:
+                            pass
+                    else:
+                        # Parse as date only
+                        try:
+                            doc[field] = date.fromisoformat(value)
+                        except ValueError:
+                            pass
+        return doc
+
+    def _add_numeric_filter(
+        self,
+        where_clauses: list[str],
+        where_params: list[Any],
+        field: str,
+        value: Any,
+    ) -> tuple[list[str], list[Any]]:
+        """
+        Add a numeric filter to the WHERE clause.
+
+        Supports:
+        - None/missing values: {"field": None}
+        - Exact match: {"field": 100}
+        - Range filters: {"field": [('>=', 100), ('<', 200)]}
+
+        Returns:
+            Tuple of (updated where_clauses, updated where_params).
+        """
+        if value is None:
+            where_clauses.append(f'd."{field}" IS NULL')
+        elif is_range_filter(value):
+            # Range filter: [('>=', 100), ('<', 200)]
+            for op, op_value in value:
+                if op in OPERATORS and op_value is not None:
+                    where_clauses.append(f'd."{field}" {op} ?')
+                    where_params.append(op_value)
+        else:
+            # Exact match
+            where_clauses.append(f'd."{field}" = ?')
+            where_params.append(value)
+
+        return where_clauses, where_params
+
+    def _add_date_filter(
+        self,
+        where_clauses: list[str],
+        where_params: list[Any],
+        field: str,
+        value: Any,
+    ) -> tuple[list[str], list[Any]]:
+        """
+        Add a date filter to the WHERE clause.
+
+        Supports:
+        - None/missing values: {"field": None}
+        - Exact match: {"field": date(...)} or {"field": "2024-01-15"}
+        - Range filters: {"field": [('>=', date(...)), ('<', date(...))]}
+
+        Returns:
+            Tuple of (updated where_clauses, updated where_params).
+        """
+        if value is None:
+            where_clauses.append(f'd."{field}" IS NULL')
+        elif is_range_filter(value):
+            # Range filter: [('>=', date(...)), ('<', date(...))]
+            for op, op_value in value:
+                if op in OPERATORS and op_value is not None:
+                    # Convert date/datetime to ISO format string for comparison
+                    if isinstance(op_value, (date, datetime)):
+                        op_value = op_value.isoformat()
+                    where_clauses.append(f'd."{field}" {op} ?')
+                    where_params.append(op_value)
+        else:
+            # Exact match - convert date/datetime to ISO format
+            if isinstance(value, (date, datetime)):
+                value = value.isoformat()
+            where_clauses.append(f'd."{field}" = ?')
+            where_params.append(value)
+
+        return where_clauses, where_params
 
     def _build_fts_query(self, query: str, boost_dict: dict[str, float]) -> str:
         """

@@ -9,9 +9,12 @@ import json
 import pickle
 import sqlite3
 import threading
+from datetime import date, datetime
 from typing import Any, Optional
 
 import numpy as np
+
+from sqlitesearch.operators import OPERATORS, is_range_filter
 
 
 class VectorSearchIndex:
@@ -23,7 +26,7 @@ class VectorSearchIndex:
     accuracy for small to medium datasets.
 
     API:
-    - __init__(keyword_fields=None, id_field=None, n_tables=8, hash_size=16)
+    - __init__(keyword_fields=None, numeric_fields=None, date_fields=None, id_field=None, n_tables=8, hash_size=16)
     - fit(vectors, payload) - Index vectors (only if index is empty)
     - add(vector, doc) - Add a single vector with document
     - search(query_vector, filter_dict=None, num_results=10, output_ids=False)
@@ -32,19 +35,23 @@ class VectorSearchIndex:
         >>> import numpy as np
         >>> index = VectorSearchIndex(
         ...     keyword_fields=["category"],
+        ...     numeric_fields=["price"],
+        ...     date_fields=["created_at"],
         ...     id_field="doc_id",
         ...     db_path="vectors.db"
         ... )
         >>> vectors = np.random.rand(100, 384)
-        >>> payload = [{"doc_id": i, "category": "test"} for i in range(100)]
+        >>> payload = [{"doc_id": i, "category": "test", "price": 100} for i in range(100)]
         >>> index.fit(vectors, payload)
         >>> query = np.random.rand(384)
-        >>> results = index.search(query)
+        >>> results = index.search(query, filter_dict={"price": [('>=', 50)]})
     """
 
     def __init__(
         self,
         keyword_fields: Optional[list[str]] = None,
+        numeric_fields: Optional[list[str]] = None,
+        date_fields: Optional[list[str]] = None,
         id_field: Optional[str] = None,
         n_tables: int = 8,
         hash_size: int = 16,
@@ -55,12 +62,16 @@ class VectorSearchIndex:
 
         Args:
             keyword_fields: List of field names for exact filtering.
+            numeric_fields: List of field names for numeric range filtering.
+            date_fields: List of field names for date range filtering.
             id_field: Field name to use as document ID. If None, auto-generates IDs.
             n_tables: Number of LSH hash tables (more = better recall, slower).
             hash_size: Number of bits per hash (more = better precision, slower).
             db_path: Path to the SQLite database file.
         """
         self.keyword_fields = list(keyword_fields) if keyword_fields is not None else []
+        self.numeric_fields = list(numeric_fields) if numeric_fields is not None else []
+        self.date_fields = list(date_fields) if date_fields is not None else []
         self.id_field = id_field
         self.n_tables = n_tables
         self.hash_size = hash_size
@@ -95,12 +106,24 @@ class VectorSearchIndex:
             keyword_cols.append(f', "{field}" TEXT')
         keyword_sql = "\n".join(keyword_cols)
 
+        # Build numeric column definitions
+        numeric_cols = []
+        for field in self.numeric_fields:
+            numeric_cols.append(f', "{field}" REAL')
+        numeric_sql = "\n".join(numeric_cols)
+
+        # Build date column definitions (store as ISO 8601 strings for comparison)
+        date_cols = []
+        for field in self.date_fields:
+            date_cols.append(f', "{field}" TEXT')
+        date_sql = "\n".join(date_cols)
+
         # Main documents table
         cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS docs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 doc_json TEXT NOT NULL,
-                vector_hash BLOB{keyword_sql}
+                vector_hash BLOB{keyword_sql}{numeric_sql}{date_sql}
             )
         """)
 
@@ -126,6 +149,10 @@ class VectorSearchIndex:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_lsh_lookup ON lsh_buckets (table_id, hash_key)")
         for field in self.keyword_fields:
             cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_vec_{field} ON docs ("{field}")')
+        for field in self.numeric_fields:
+            cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_vec_num_{field} ON docs ("{field}")')
+        for field in self.date_fields:
+            cursor.execute(f'CREATE INDEX IF NOT EXISTS idx_vec_date_{field} ON docs ("{field}")')
 
         conn.commit()
 
@@ -255,22 +282,46 @@ class VectorSearchIndex:
         conn = self._get_conn()
         cursor = conn.cursor()
 
-        # Build column lists
-        all_cols = ["doc_json", "vector_hash"] + [f'"{field}"' for field in self.keyword_fields]
+        # Build column lists including keyword, numeric, and date fields
+        filter_cols = (
+            [f'"{field}"' for field in self.keyword_fields] +
+            [f'"{field}"' for field in self.numeric_fields] +
+            [f'"{field}"' for field in self.date_fields]
+        )
+        all_cols = ["doc_json", "vector_hash"] + filter_cols
         col_names = ", ".join(all_cols)
         placeholders = ", ".join(["?"] * len(all_cols))
 
         # Insert documents and LSH buckets
         for i, (vector, doc) in enumerate(zip(vectors, payload)):
-            doc_json = json.dumps(doc)
+            # Convert date/datetime objects to ISO format for JSON serialization
+            doc_for_json = {}
+            for key, value in doc.items():
+                if isinstance(value, (date, datetime)):
+                    doc_for_json[key] = value.isoformat()
+                else:
+                    doc_for_json[key] = value
+            doc_json = json.dumps(doc_for_json)
             vector_bytes = pickle.dumps(vector)
 
             keyword_vals = [doc.get(field) for field in self.keyword_fields]
 
+            # Extract numeric values
+            numeric_vals = [doc.get(field) for field in self.numeric_fields]
+
+            # Extract date values and convert to ISO format
+            date_vals = []
+            for field in self.date_fields:
+                value = doc.get(field)
+                if isinstance(value, (date, datetime)):
+                    date_vals.append(value.isoformat())
+                else:
+                    date_vals.append(value)
+
             # Insert into docs table
             cursor.execute(
                 f"INSERT INTO docs ({col_names}) VALUES ({placeholders})",
-                [doc_json, vector_bytes] + keyword_vals
+                [doc_json, vector_bytes] + keyword_vals + numeric_vals + date_vals
             )
             doc_id = cursor.lastrowid
 
@@ -383,7 +434,7 @@ class VectorSearchIndex:
         candidate_ids: set[int],
         filter_dict: dict[str, Any],
     ) -> set[int]:
-        """Apply keyword filters to candidate IDs."""
+        """Apply keyword, numeric, and date filters to candidate IDs."""
         if not filter_dict:
             return candidate_ids
 
@@ -391,27 +442,142 @@ class VectorSearchIndex:
         ids_list = list(candidate_ids)
 
         for field, value in filter_dict.items():
-            if field not in self.keyword_fields:
-                continue
+            # Keyword field filters
+            if field in self.keyword_fields:
+                placeholders = ",".join("?" * len(ids_list))
+                if value is None:
+                    cursor.execute(
+                        f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+                        f'AND "{field}" IS NULL',
+                        ids_list
+                    )
+                else:
+                    cursor.execute(
+                        f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+                        f'AND "{field}" = ?',
+                        ids_list + [value]
+                    )
+                valid_ids = set(row["id"] for row in cursor.fetchall())
+                filtered_ids &= valid_ids
 
-            placeholders = ",".join("?" * len(ids_list))
-            if value is None:
-                cursor.execute(
-                    f'SELECT id FROM docs WHERE id IN ({placeholders}) '
-                    f'AND "{field}" IS NULL',
-                    ids_list
-                )
-            else:
-                cursor.execute(
-                    f'SELECT id FROM docs WHERE id IN ({placeholders}) '
-                    f'AND "{field}" = ?',
-                    ids_list + [value]
+            # Numeric field filters
+            elif field in self.numeric_fields:
+                filtered_ids = self._apply_numeric_filter(
+                    cursor, field, value, filtered_ids
                 )
 
-            valid_ids = set(row["id"] for row in cursor.fetchall())
-            filtered_ids &= valid_ids
+            # Date field filters
+            elif field in self.date_fields:
+                filtered_ids = self._apply_date_filter(
+                    cursor, field, value, filtered_ids
+                )
 
         return filtered_ids
+
+    def _apply_numeric_filter(
+        self,
+        cursor: sqlite3.Cursor,
+        field: str,
+        value: Any,
+        candidate_ids: set[int],
+    ) -> set[int]:
+        """Apply a numeric filter to candidate IDs."""
+        if not candidate_ids:
+            return candidate_ids
+
+        ids_list = list(candidate_ids)
+        placeholders = ",".join("?" * len(ids_list))
+
+        if value is None:
+            cursor.execute(
+                f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+                f'AND "{field}" IS NULL',
+                ids_list
+            )
+        elif is_range_filter(value):
+            # Range filter: [('>=', 100), ('<', 200)]
+            where_conditions = []
+            params = ids_list.copy()
+            for op, op_value in value:
+                if op in OPERATORS and op_value is not None:
+                    where_conditions.append(f'"{field}" {op} ?')
+                    params.append(op_value)
+            if where_conditions:
+                where_sql = " AND " + " AND ".join(where_conditions)
+                cursor.execute(
+                    f'SELECT id FROM docs WHERE id IN ({placeholders}){where_sql}',
+                    params
+                )
+            else:
+                # No valid conditions, return all candidates
+                cursor.execute(
+                    f'SELECT id FROM docs WHERE id IN ({placeholders})',
+                    ids_list
+                )
+        else:
+            # Exact match
+            cursor.execute(
+                f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+                f'AND "{field}" = ?',
+                ids_list + [value]
+            )
+
+        return set(row["id"] for row in cursor.fetchall()) & candidate_ids
+
+    def _apply_date_filter(
+        self,
+        cursor: sqlite3.Cursor,
+        field: str,
+        value: Any,
+        candidate_ids: set[int],
+    ) -> set[int]:
+        """Apply a date filter to candidate IDs."""
+        if not candidate_ids:
+            return candidate_ids
+
+        ids_list = list(candidate_ids)
+        placeholders = ",".join("?" * len(ids_list))
+
+        if value is None:
+            cursor.execute(
+                f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+                f'AND "{field}" IS NULL',
+                ids_list
+            )
+        elif is_range_filter(value):
+            # Range filter: [('>=', date(...)), ('<', date(...))]
+            where_conditions = []
+            params = ids_list.copy()
+            for op, op_value in value:
+                if op in OPERATORS and op_value is not None:
+                    # Convert date/datetime to ISO format for comparison
+                    if isinstance(op_value, (date, datetime)):
+                        op_value = op_value.isoformat()
+                    where_conditions.append(f'"{field}" {op} ?')
+                    params.append(op_value)
+            if where_conditions:
+                where_sql = " AND " + " AND ".join(where_conditions)
+                cursor.execute(
+                    f'SELECT id FROM docs WHERE id IN ({placeholders}){where_sql}',
+                    params
+                )
+            else:
+                # No valid conditions, return all candidates
+                cursor.execute(
+                    f'SELECT id FROM docs WHERE id IN ({placeholders})',
+                    ids_list
+                )
+        else:
+            # Exact match - convert date/datetime to ISO format
+            if isinstance(value, (date, datetime)):
+                value = value.isoformat()
+            cursor.execute(
+                f'SELECT id FROM docs WHERE id IN ({placeholders}) '
+                f'AND "{field}" = ?',
+                ids_list + [value]
+            )
+
+        return set(row["id"] for row in cursor.fetchall()) & candidate_ids
 
     def _rerank(
         self,
@@ -438,6 +604,8 @@ class VectorSearchIndex:
         for row in cursor.fetchall():
             vector = pickle.loads(row["vector_hash"])
             doc = json.loads(row["doc_json"])
+            # Convert ISO date strings back to date/datetime objects
+            doc = self._convert_dates(doc)
             candidates.append((row["id"], vector, doc))
 
         # Compute cosine similarities
@@ -487,6 +655,40 @@ class VectorSearchIndex:
         row = cursor.fetchone()
         if row:
             self._random_vectors = pickle.loads(row["value"])
+
+    def _convert_dates(self, doc: dict[str, Any]) -> dict[str, Any]:
+        """
+        Convert ISO date strings back to date/datetime objects for date_fields.
+
+        Args:
+            doc: Document with potentially ISO formatted date strings.
+
+        Returns:
+            Document with date fields converted back to date/datetime objects.
+        """
+        if not self.date_fields:
+            return doc
+
+        for field in self.date_fields:
+            if field in doc and doc[field] is not None:
+                value = doc[field]
+                if isinstance(value, str):
+                    # Check if string contains time component (has 'T' or ' ')
+                    has_time = 'T' in value or ' ' in value
+
+                    if has_time:
+                        # Parse as datetime
+                        try:
+                            doc[field] = datetime.fromisoformat(value)
+                        except ValueError:
+                            pass
+                    else:
+                        # Parse as date only
+                        try:
+                            doc[field] = date.fromisoformat(value)
+                        except ValueError:
+                            pass
+        return doc
 
     def close(self) -> None:
         """Close the database connection."""
